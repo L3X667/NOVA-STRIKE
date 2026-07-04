@@ -137,6 +137,13 @@
     color:var(--text); font-size:16px; display:flex; align-items:center; justify-content:center;
     cursor:pointer;
   }
+  #mute-btn{
+    position:fixed; top:max(10px, env(safe-area-inset-top)); left:12px; z-index:25;
+    width:38px; height:38px; border-radius:8px;
+    background:rgba(10,8,26,.7); border:1px solid rgba(255,255,255,.2);
+    color:var(--text); font-size:16px; display:flex; align-items:center; justify-content:center;
+    cursor:pointer;
+  }
 
   #boost-legend{
     display:grid; grid-template-columns:1fr 1fr; gap:6px 22px;
@@ -174,6 +181,7 @@
     <div id="boss-bar-bg"><div id="boss-bar-fill"></div></div>
   </div>
   <button id="pause-btn">❚❚</button>
+  <button id="mute-btn">🔊</button>
   <div class="flash-msg" id="flash-msg"></div>
 
   <!-- Menu -->
@@ -282,6 +290,115 @@ const Audio_ = {
 };
 
 /* ============================================================
+   MUSIQUE DE FOND — ambiance spatiale procédurale (Web Audio, aucun fichier)
+   Nappe grave continue + arpège de balises façon "radar", tempo qui accélère
+   en combat et surtout pendant les combats de boss.
+   ============================================================ */
+const Music = {
+  ctx:null, master:null, filter:null, delay:null, delayGain:null,
+  droneOsc1:null, droneOsc2:null, droneGain:null,
+  playing:false, muted:false, currentMood:'menu', bossOn:false,
+  bpm:96, step:0, nextStepTime:0, schedulerId:null,
+  lookahead:25, scheduleAhead:0.15,
+  rootFreq:65.41, // Do2 — nappe spatiale grave
+  arpPattern:[0,7,10,12,10,7,3,0, 12,19,15,12,15,19,12,7],
+
+  init(){
+    const ctx = Audio_.ctx;
+    if(!ctx || this.ctx) return;
+    this.ctx = ctx;
+    this.master = ctx.createGain(); this.master.gain.value = 0;
+    this.filter = ctx.createBiquadFilter();
+    this.filter.type = 'lowpass'; this.filter.frequency.value = 900; this.filter.Q.value = 0.7;
+    this.delay = ctx.createDelay(1.0); this.delay.delayTime.value = (60/this.bpm)*0.5;
+    this.delayGain = ctx.createGain(); this.delayGain.gain.value = 0.2;
+    this.filter.connect(this.master);
+    this.filter.connect(this.delay); this.delay.connect(this.delayGain); this.delayGain.connect(this.master);
+    this.master.connect(ctx.destination);
+
+    // Nappe grave continue (drone spatial)
+    this.droneGain = ctx.createGain(); this.droneGain.gain.value = 0.16;
+    this.droneOsc1 = ctx.createOscillator(); this.droneOsc1.type = 'sawtooth';
+    this.droneOsc1.frequency.value = this.rootFreq;
+    this.droneOsc2 = ctx.createOscillator(); this.droneOsc2.type = 'sawtooth';
+    this.droneOsc2.frequency.value = this.rootFreq*1.005; // léger détune, effet "moteur"
+    this.droneOsc1.connect(this.droneGain); this.droneOsc2.connect(this.droneGain);
+    this.droneGain.connect(this.filter);
+    this.droneOsc1.start(); this.droneOsc2.start();
+  },
+  unlock(){ Audio_.init(); this.init(); if(this.ctx && this.ctx.state==='suspended') this.ctx.resume(); },
+  start(){
+    this.unlock();
+    if(!this.ctx || this.playing) return;
+    this.playing = true; this.step = 0;
+    this.nextStepTime = this.ctx.currentTime + 0.1;
+    this.schedulerId = setInterval(()=>this.scheduler(), this.lookahead);
+    this.setMood(this.currentMood);
+  },
+  setMood(mood){
+    this.currentMood = mood;
+    if(!this.ctx) return;
+    const cfg = {
+      menu:{gain:0.22,cutoff:600,bpm:88}, combat:{gain:0.4,cutoff:1000,bpm:104},
+      boss:{gain:0.52,cutoff:1900,bpm:132}, paused:{gain:0.1,cutoff:450,bpm:88},
+      gameover:{gain:0.16,cutoff:380,bpm:80}, victory:{gain:0.3,cutoff:1300,bpm:110}
+    }[mood] || {gain:0.35,cutoff:800,bpm:96};
+    const now = this.ctx.currentTime;
+    this.bpm = cfg.bpm;
+    this.master.gain.cancelScheduledValues(now);
+    this.master.gain.setValueAtTime(this.master.gain.value, now);
+    this.master.gain.linearRampToValueAtTime(this.muted?0:cfg.gain, now+0.9);
+    this.filter.frequency.cancelScheduledValues(now);
+    this.filter.frequency.setValueAtTime(this.filter.frequency.value, now);
+    this.filter.frequency.linearRampToValueAtTime(cfg.cutoff, now+0.9);
+  },
+  toggleMute(){
+    this.muted = !this.muted;
+    this.setMood(this.currentMood);
+    return this.muted;
+  },
+  scheduler(){
+    while(this.nextStepTime < this.ctx.currentTime + this.scheduleAhead){
+      this.playStep(this.step, this.nextStepTime);
+      this.nextStepTime += (60/this.bpm)/4; // double-croche
+      this.step = (this.step+1) % 16;
+    }
+  },
+  playStep(i, t){
+    // arpège façon "bip radar", une octave et demi au-dessus de la nappe
+    const semis = this.arpPattern[i];
+    this.blip(this.rootFreq*4*Math.pow(2,semis/12), t, 0.12, 0.13);
+    if(i % 4 === 0) this.pulse(t); // pulsation grave rythmique
+    if(this.bossOn && i % 8 === 4) this.blip(this.rootFreq*2, t, 0.4, 0.22);
+  },
+  blip(freq, t, dur, gain){
+    if(!this.ctx) return;
+    const o = this.ctx.createOscillator(); const g = this.ctx.createGain();
+    o.type = 'triangle'; o.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(gain,0.0002), t+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+    o.connect(g); g.connect(this.filter);
+    o.start(t); o.stop(t+dur+0.03);
+  },
+  pulse(t){
+    if(!this.ctx) return;
+    const o=this.ctx.createOscillator(); const g=this.ctx.createGain();
+    o.type='sine'; o.frequency.setValueAtTime(110,t); o.frequency.exponentialRampToValueAtTime(35,t+0.2);
+    g.gain.setValueAtTime(0.5,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.22);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t+0.24);
+  }
+};
+function unlockMusicOnce(){
+  Music.unlock(); Music.start();
+  document.removeEventListener('pointerdown', unlockMusicOnce);
+  document.removeEventListener('keydown', unlockMusicOnce);
+}
+document.addEventListener('pointerdown', unlockMusicOnce, {once:true});
+document.addEventListener('keydown', unlockMusicOnce, {once:true});
+
+/* ============================================================
    BOOST DEFINITIONS
    ============================================================ */
 const BOOSTS = [
@@ -309,13 +426,23 @@ function boostById(id){ return BOOSTS.find(b=>b.id===id); }
 /* ============================================================
    LEVELS
    ============================================================ */
-const LEVELS = [
-  { kills:12, spawnMs:1100, enemySpeed:70,  enemyHp:1, bossHp:40,  bossSpeed:90,  bossName:'GARDIEN SAUCOUPE' },
-  { kills:16, spawnMs:950,  enemySpeed:85,  enemyHp:1, bossHp:60,  bossSpeed:110, bossName:'DESTRUCTEUR ORBITAL' },
-  { kills:20, spawnMs:820,  enemySpeed:100, enemyHp:2, bossHp:85,  bossSpeed:130, bossName:'FAUCHEUSE STELLAIRE' },
-  { kills:24, spawnMs:700,  enemySpeed:115, enemyHp:2, bossHp:115, bossSpeed:150, bossName:'MATRICE ABYSSALE' },
-  { kills:28, spawnMs:600,  enemySpeed:130, enemyHp:3, bossHp:150, bossSpeed:170, bossName:'EMPEREUR DU NÉANT' },
+const BOSS_NAMES = [
+  'GARDIEN SAUCOUPE','DESTRUCTEUR ORBITAL','FAUCHEUSE STELLAIRE','MATRICE ABYSSALE','EMPEREUR DU NÉANT',
+  'SENTINELLE DE PLASMA','HYDRE CRYOGÉNIQUE','LEVIATHAN QUANTIQUE','FORTERESSE ÉCARLATE','SPECTRE NÉBULEUX',
+  'COLOSSE DE FER NOIR','ORACLE DES ÉTOILES MORTES','DÉVOREUR DE GALAXIES','TITAN PHOTONIQUE','GARDIENNE DU VIDE',
+  'RUCHE ESSAIM NOIR','CITADELLE FANTÔME','CHIMÈRE D\'ANTIMATIÈRE','HÉRAUT DE LA SINGULARITÉ','LÉGION D\'ACIER STELLAIRE',
+  'ARCHONTE DES COMÈTES','BROYEUR D\'ASTÉROÏDES','WYRM DE PLASMA','MONOLITHE OUBLIÉ','TEMPÊTE IONIQUE SUPRÊME',
+  'DIEU-MACHINE DÉCHU','CŒUR DE LA SUPERNOVA','ULTIME GARDIEN DE NOVA','AVATAR DU CHAOS STELLAIRE','L\'ABSOLU — NÉMÉSIS DE NOVA'
 ];
+const LEVELS = BOSS_NAMES.map((name, i)=>({
+  kills:      Math.min(12 + i*2, 50),
+  spawnMs:    Math.max(260, 1100 - i*28),
+  enemySpeed: Math.min(70 + i*6, 250),
+  enemyHp:    1 + Math.floor(i/4),
+  bossHp:     40 + i*20,
+  bossSpeed:  Math.min(90 + i*6, 250),
+  bossName:   name
+}));
 
 /* ============================================================
    GAME STATE
@@ -435,6 +562,8 @@ function resetGame(){
 
 function startGame(){
   Audio_.init();
+  Music.bossOn = false;
+  Music.setMood('combat');
   resetGame();
   state='playing';
   hideAllOverlays();
@@ -515,7 +644,7 @@ function revertBoost(id){
    ============================================================ */
 function spawnEnemy(){
   const lv = LEVELS[levelIdx];
-  const elite = Math.random() < 0.15 + levelIdx*0.03;
+  const elite = Math.random() < Math.min(0.15 + levelIdx*0.015, 0.55);
   enemies.push({
     x: rand(40, W-40), y: -40,
     baseX: 0, phase: rand(0,Math.PI*2), amp: rand(30,80),
@@ -539,6 +668,8 @@ function spawnBoss(){
     name: lv.bossName,
   };
   bossSpawned = true;
+  Music.bossOn = true;
+  Music.setMood('boss');
   document.getElementById('boss-name').textContent = lv.bossName;
   document.getElementById('boss-bar-wrap').style.display='block';
   flash('⚠ BOSS ⚠', '#ff3d6e');
@@ -869,6 +1000,8 @@ function updateBossBar(){
 
 function killBoss(){
   Audio_.explosion();
+  Music.bossOn = false;
+  Music.setMood('combat');
   spawnParticles(boss.x,boss.y,'#ff3d6e',60,260,0.9);
   spawnParticles(boss.x,boss.y,'#ffcf4d',40,180,0.7);
   shake = 0.6;
@@ -884,6 +1017,7 @@ function killBoss(){
    ============================================================ */
 function levelComplete(bonus){
   state='levelup';
+  Music.setMood('menu');
   document.getElementById('lu-score').textContent = score;
   document.getElementById('lu-bonus').textContent = bonus;
   document.getElementById('levelup-sub').textContent = LEVELS[levelIdx].bossName+' vaincu';
@@ -898,18 +1032,23 @@ function nextLevel(){
     document.getElementById('win-score').textContent = score;
     document.getElementById('victory-screen').classList.remove('hidden');
     Audio_.win();
+    Music.bossOn = false;
+    Music.setMood('victory');
     return;
   }
   killsThisLevel=0; killsSince3=0; bossSpawned=false; spawnTimer=0;
   enemies=[]; enemyBullets=[]; missiles=[];
   player.invuln=1.2;
   state='playing';
+  Music.setMood('combat');
   updateHUD();
 }
 
 function endGame(){
   state='gameover';
   Audio_.gameover();
+  Music.bossOn = false;
+  Music.setMood('gameover');
   document.getElementById('go-score').textContent = score;
   document.getElementById('go-level').textContent = (levelIdx+1);
   document.getElementById('gameover-screen').classList.remove('hidden');
@@ -931,9 +1070,11 @@ function updateHUD(){
 function togglePause(){
   if(state==='playing'){
     state='paused';
+    Music.setMood('paused');
     document.getElementById('pause-screen').classList.remove('hidden');
   } else if(state==='paused'){
     state='playing';
+    Music.setMood(Music.bossOn ? 'boss' : 'combat');
     document.getElementById('pause-screen').classList.add('hidden');
   }
 }
@@ -1157,6 +1298,11 @@ document.getElementById('btn-restart-win').addEventListener('click', startGame);
 document.getElementById('btn-next').addEventListener('click', nextLevel);
 document.getElementById('pause-btn').addEventListener('click', togglePause);
 document.getElementById('btn-resume').addEventListener('click', togglePause);
+const muteBtnEl_ns = document.getElementById('mute-btn');
+muteBtnEl_ns.addEventListener('click', ()=>{
+  const muted = Music.toggleMute();
+  muteBtnEl_ns.textContent = muted ? '🔇' : '🔊';
+});
 
 // menu badge ship
 (function drawMenuShip(){
